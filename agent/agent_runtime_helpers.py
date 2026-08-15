@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
-    _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
+    _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, deterministic_call_id, tool_call_id_variants,
+    tool_result_id_variants,
 )
 from agent.message_metadata import (
     TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
@@ -2929,6 +2930,57 @@ def _repair_invalid_tool_call_names(messages: list[dict[str, Any]]) -> None:
                 }
 
 
+def _repair_missing_tool_call_ids(messages: list[dict[str, Any]]) -> None:
+    """Give every assistant tool_call an id: an empty/missing id cannot be paired with its result, so
+    strict endpoints (Gemini/Antigravity) reject the turn. The id is deterministic (name, args, index)
+    to keep the cached prefix stable; rewritten copy-on-write like ``_repair_invalid_tool_call_names``."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        tcs = msg.get("tool_calls") or []
+        for idx, tc in enumerate(tcs):
+            if _ra().AIAgent._get_tool_call_id_static(tc):
+                continue
+            fn = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+            name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)) or "invalid_tool_call"
+            args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+            args = args if isinstance(args, str) else "{}"
+            new_id = deterministic_call_id(name, args, idx)
+            _ra().logger.warning(
+                "Pre-call sanitizer: repairing tool_call with empty/missing id -> %r (name=%s)", new_id, name,
+            )
+            if tcs is msg.get("tool_calls"):
+                tcs = msg["tool_calls"] = list(tcs)
+            base = tc if isinstance(tc, dict) else {"type": "function", "function": {"name": name, "arguments": args}}
+            tcs[idx] = {**base, "id": new_id, "call_id": new_id}
+
+
+def _repair_empty_tool_message_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair a tool result with an empty ``tool_call_id`` to the first still-unanswered call of the
+    assistant turn it follows, instead of letting ``_drop_results_without_ids`` discard a real result.
+    Returns a new list; repaired results are copies so persisted history is untouched."""
+    out: list[dict[str, Any]] = []
+    pending: list[Any] = []
+    for msg in messages:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        if role == "assistant":
+            pending = [tc for tc in (msg.get("tool_calls") or []) if _ra().AIAgent._get_tool_call_id_static(tc)]
+        elif role == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            if cid:
+                pending = [tc for tc in pending if not (tool_call_id_variants(tc) & tool_result_id_variants(cid))]
+            elif pending:
+                tc = pending.pop(0)
+                msg = {**msg, "tool_call_id": _ra().AIAgent._get_tool_call_id_static(tc)}
+                if not (msg.get("name") or "").strip():
+                    msg["name"] = _ra().AIAgent._get_tool_call_name_static(tc) or "unknown"
+                _ra().logger.debug("Pre-call sanitizer: paired empty tool_call_id with call %s", msg["tool_call_id"])
+        else:
+            pending = []
+        out.append(msg)
+    return out
+
+
 def _drop_results_without_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop tool results with a missing/empty tool_call_id. Kept explicit (not left to the
     positional walk) for its own log line and so the final-chokepoint guarantee holds for
@@ -3148,6 +3200,8 @@ def sanitize_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]
     messages = repair_empty_non_final_messages(messages)
     messages = _drop_empty_tool_calls_arrays(messages)
     _repair_invalid_tool_call_names(messages)
+    _repair_missing_tool_call_ids(messages)
+    messages = _repair_empty_tool_message_ids(messages)
     messages = _drop_results_without_ids(messages)
     messages = _pair_tool_calls_positionally(messages)
     messages = _dedupe_tool_call_ids(messages)
